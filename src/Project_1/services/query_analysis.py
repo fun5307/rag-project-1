@@ -48,6 +48,7 @@ INTENT_TERMS = {
     "위험": "작업 위험요인 안전조치 작업방법",
     "일반": "안전작업 방법 점검사항 예방조치",
 }
+SEARCH_OBJECT_TERMS = ("팔레트", "배관", "철재", "외벽", "조명")
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,9 @@ def analyze_query(question: str, resolved_question: str | None = None) -> WorkCo
         elif work_type == "줄걸이·인양":
             category = "크레인·줄걸이"
 
-    core = " ".join(part for part in (equipment, work_type, *hazards) if part)
+    # 장비·작업 유형만 남기면 팔레트 같은 현재 작업 대상이 사라져 검색이 넓어진다.
+    work_objects = tuple(term for term in SEARCH_OBJECT_TERMS if term in text)
+    core = " ".join(part for part in (equipment, work_type, *work_objects, *hazards) if part)
     sif_query = f"{core} 산업재해 유사 사고사례 사고 원인 재해유발요인".strip()
     kosha_query = f"{core} {INTENT_TERMS[intent]}".strip()
     return WorkContext(question.strip(), resolved, equipment, work_type, hazards, intent,

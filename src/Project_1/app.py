@@ -83,10 +83,14 @@ def render_analysis(report: SafetyAnalysis | None):
         with st.expander("개발용 검색 진단", expanded=False):
             st.markdown("**분석된 Query / Work Context**")
             st.json(debug.get("query", {}))
+            st.caption("아래는 검색 후보입니다. SIF 점수는 모델 평가값, KOSHA 점수는 섹션·메타데이터를 더한 상대 순위값이며 최종 근거 채택과 구분됩니다.")
             st.markdown("**SIF Top 결과 · 재정렬 이유**")
             st.dataframe(debug.get("sif_top", []), hide_index=True, width="stretch")
             st.markdown("**KOSHA Top 결과 · 재정렬 이유**")
             st.dataframe(debug.get("kosha_top", []), hide_index=True, width="stretch")
+            if debug.get("answer_gate"):
+                st.markdown("**최종 답변의 근거 채택 판단**")
+                st.json(debug["answer_gate"])
             for note in debug.get("retrieval_notes", []):
                 st.caption(note)
 
