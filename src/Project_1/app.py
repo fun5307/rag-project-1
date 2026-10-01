@@ -145,7 +145,8 @@ with safety_tab:
             reply = {"role": "assistant", "analysis": report}
         except Exception:
             logger.exception("작업 안전 상담 처리 실패")
-            reply = {"role": "assistant", "error": "지금은 안전 근거를 조회하거나 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."}
+            st.exception(e)
+            # reply = {"role": "assistant", "error": "지금은 안전 근거를 조회하거나 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."}
         st.session_state.safety_messages.extend([
             {"role": "user", "content": question},
             reply,
