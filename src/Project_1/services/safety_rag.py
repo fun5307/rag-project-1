@@ -4,11 +4,14 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 import os
 from pathlib import Path
+import re
 from typing import Sequence
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 import numpy as np
 import psycopg
+import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
@@ -18,13 +21,48 @@ from langchain_postgres import PGVector, PostgresChatMessageHistory
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field
 
-from services.query_analysis import WorkContext, analyze_query
+from services.query_analysis import WorkContext, analyze_query, meaningful_terms
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(REPO_ROOT / ".env")
-DB_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:pgvector-demo@127.0.0.1:5432/rag"
-PGVECTOR_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+
+def setting(name: str) -> str | None:
+    """Cloud Secrets를 우선하고, 로컬에서는 환경변수·.env도 사용할 수 있게 한다."""
+    try:
+        value = st.secrets.get(name)
+    except (FileNotFoundError, KeyError):
+        value = None
+    return str(value) if value else os.getenv(name)
+
+
+def database_url() -> tuple[str, bool, bool, str | None]:
+    """Supabase 세션 풀러 URL을 우선 사용하고 SSL을 요구한다."""
+    supabase_url = setting("SUPABASE_DB_URL")
+    configured_url = supabase_url or setting("DATABASE_URL")
+    if not configured_url:
+        return "postgresql://postgres:pgvector-demo@127.0.0.1:5432/rag", False, False, None
+
+    parts = urlsplit(configured_url)
+    host = parts.hostname or ""
+    is_supabase = bool(supabase_url) or host.endswith((".supabase.co", ".supabase.com"))
+    if is_supabase:
+        if parts.scheme not in ("postgresql", "postgres"):
+            return configured_url, True, True, "SUPABASE_DB_URL에는 Supabase의 PostgreSQL 연결 문자열을 넣어 주세요."
+        if host.endswith(".pooler.supabase.com") and parts.port != 5432:
+            return configured_url, True, True, "Supabase의 Session pooler 연결 문자열(포트 5432)을 사용해 주세요."
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if query.get("sslmode") not in ("verify-ca", "verify-full"):
+            query["sslmode"] = "require"
+        configured_url = urlunsplit(parts._replace(query=urlencode(query)))
+    return configured_url, True, is_supabase, None
+
+
+DB_URL, DATABASE_URL_CONFIGURED, IS_SUPABASE, DB_CONFIG_ERROR = database_url()
+PGVECTOR_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1).replace(
+    "postgres://", "postgresql+psycopg://", 1
+)
 EMBEDDING_MODEL = "text-embedding-3-small"
 VECTOR_DIM = 1536
 CHAT_MODEL = "gpt-6-luna"
@@ -34,6 +72,10 @@ SIF_RELEVANCE_MIN = 30
 RECENT_MESSAGES = 8
 HISTORY_TABLE = "chat_history"
 KOSHA_COLLECTION = "kosha_guides"
+
+
+class SafetyRAGConfigurationError(RuntimeError):
+    """사용자에게 알려도 비밀 값이 노출되지 않는 배포 설정 오류."""
 
 # Day 10의 명확한 장비·사고유형 조건만 필터로 사용한다.
 OBJECT_RULES = {
@@ -65,9 +107,8 @@ KOSHA_CATEGORIES = {
     "전기작업": ("전기작업", "정전작업", "충전전로", "감전"),
     "작업발판·비계·사다리": ("작업발판", "비계", "사다리"),
 }
-FOLLOWUP_PREFIXES = ("그럼", "그러면", "그중", "그 가운데", "그것", "그 경우", "그때")
-DOMAIN_TERMS = tuple({alias for rules in OBJECT_RULES.values() for alias in rules[0]}
-                     | {alias for aliases in KOSHA_CATEGORIES.values() for alias in aliases})
+FOLLOWUP_PREFIXES = ("그럼", "그러면", "그중", "그 가운데", "그것", "그 경우", "그때", "그 작업", "그 사고")
+SHORT_FOLLOWUP_PREFIXES = ("예방하려면", "방지하려면", "사고를 예방", "작업 전에는", "위험은", "어떤 점을")
 
 
 @dataclass(frozen=True)
@@ -96,10 +137,15 @@ class SafetyAnalysis:
     search_query: str = ""  # 화면에는 표시하지 않는 검증·진단용 값
     debug: dict = field(default_factory=dict)
     history_saved: bool = False
+    topic: str = ""
+    intent: str = "일반"
+    followup: bool = False
+    sif_documents: list[Document] = field(default_factory=list, repr=False)
+    kosha_documents: list[Document] = field(default_factory=list, repr=False)
 
 
 class GeneratedSafety(BaseModel):
-    work_summary: str = Field(description="현재 작업과 주요 위험의 짧은 요약")
+    work_summary: str = Field(description="첫 질문은 작업 요약, 후속 질문은 현재 질문에 대한 한 문장 직접 답변")
     sif_supported: bool = Field(description="검색된 SIF 중 현재 작업과 직접 관련된 사고가 있는지")
     kosha_supported: bool = Field(description="검색된 KOSHA 중 현재 작업과 직접 관련된 안전기준이 있는지")
     hazards: list[str] = Field(description="근거 ID를 붙인 주요 위험요인")
@@ -125,12 +171,15 @@ SIF 사례에 없는 사고 경위를 만들지 말고, KOSHA 발췌에 없는 �
 SIF의 예시 대책을 KOSHA 기준으로 부르지 마세요. KOSHA GUIDE를 법적 의무라고 단정하지 마세요.
 한쪽 근거가 없으면 해당 요약에는 근거가 없다고 쓰고 남은 근거로만 답하세요.
 예방조치는 제공된 SIF/KOSHA 내용으로 뒷받침되는 범위만 작성하세요.
-사이드바 산업분류는 보조 정보입니다. 사용자의 자연어 작업·장비 표현을 우선하세요."""),
+사이드바 산업분류는 보조 정보입니다. 사용자의 자연어 작업·장비 표현을 우선하세요.
+후속 질문이면 이전 답변 전체를 반복하지 말고 현재 질문의 점검·위험·예방 요청에 직접 답하세요. work_summary는 이번 질문의 핵심 답변 한 문장으로 쓰고, hazards와 prevention에는 이번 질문에 필요한 항목만 넣으세요."""),
     MessagesPlaceholder("history"),
     ("human", """현재 질문: {question}
 SIF 사고사례 검색 문장: {sif_query}
 KOSHA 안전기준 검색 문장: {kosha_query}
 분석된 작업/장비/위험: {work_context}
+후속 질문 여부: {followup}
+이번 질문의 목적: {intent}
 사이드바 산업분류(보조): {industry}
 
 === SIF 사고사례 ===
@@ -159,14 +208,35 @@ class RerankBatch(BaseModel):
     rankings: list[CandidateJudgment]
 
 
-def make_search_query(question: str, history: Sequence) -> str:
-    """Day 5의 최근 사용자 질문 앵커를 이용해 생략된 후속 질문을 검색 가능한 문장으로 만든다."""
+def is_followup(question: str) -> bool:
+    """지시어로 이어지는 질문은 맥락을 유지하되, 새 작업 대상을 명시하면 전환한다."""
     text = question.strip()
-    previous = [m.content for m in history if isinstance(m, HumanMessage) and isinstance(m.content, str)]
-    followup = text.startswith(FOLLOWUP_PREFIXES) or (len(text) <= 45 and not any(term in text for term in DOMAIN_TERMS))
-    if not followup or not previous:
+    for prefix in ("그럼", "그러면"):
+        if text.startswith(prefix):
+            rest = text[len(prefix):].strip(" ,")
+            terms = meaningful_terms(rest)
+            # '그러면 뭐 점검하면 되는데?'는 새 명사가 아니라 직전 작업의 점검 요청이다.
+            # '그럼 나무 절단 작업은?'처럼 새 대상이 명시된 경우에는 이전 장비를 버린다.
+            named_work = bool(re.search(r"^.+\s+작업(?:은|는|의|에서|을|를|\s|\?)", rest)) and not rest.startswith(
+                ("뭐", "뭘", "무엇", "어떤", "작업 전", "작업 후", "작업 중")
+            ) and not re.search(r"작업\s*(?:전|후|중|시|때)", rest)
+            named_subject = bool(re.fullmatch(r"[가-힣A-Za-z0-9]+(?:은|는|에 대해서|관련해서)\??", rest))
+            named_action = bool(re.search(r"(?:을|를)\s*\S+\s*(?:할 때|할때|하려면|하면)", rest))
+            return not (terms and (named_work or named_subject or named_action))
+    return text.startswith(FOLLOWUP_PREFIXES) or (len(text) <= 22 and text.startswith(SHORT_FOLLOWUP_PREFIXES))
+
+
+def make_search_query(question: str, history: Sequence, topic: str | None = None) -> str:
+    """새 주제는 원문 그대로, 후속 질문은 현재 세션의 작업 맥락과 결합한다."""
+    text = question.strip()
+    if not is_followup(text):
         return text
-    anchor = next((p for p in reversed(previous) if any(term in p for term in DOMAIN_TERMS)), previous[-1])
+    if topic:
+        return f"{topic} {text}"
+    previous = [m.content for m in history if isinstance(m, HumanMessage) and isinstance(m.content, str)]
+    if not previous:
+        return text
+    anchor = next((p for p in reversed(previous) if not is_followup(p)), previous[-1])
     return f"{anchor} {text}"
 
 
@@ -273,40 +343,67 @@ def history_text(report: SafetyAnalysis) -> str:
 
 class SafetyRAGService:
     def __init__(self):
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다.")
-        self.embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-        self.answer_llm = ChatOpenAI(model=CHAT_MODEL, reasoning_effort="none").with_structured_output(
+        if DB_CONFIG_ERROR:
+            raise SafetyRAGConfigurationError(DB_CONFIG_ERROR)
+        api_key = setting("OPENAI_API_KEY")
+        if not api_key:
+            raise SafetyRAGConfigurationError("OPENAI_API_KEY가 없습니다. Streamlit Cloud의 Secrets 설정을 확인해 주세요.")
+        self.embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key)
+        self.answer_llm = ChatOpenAI(model=CHAT_MODEL, reasoning_effort="none", api_key=api_key).with_structured_output(
             GeneratedSafety, method="json_schema"
         )
-        self.rerank_llm = ChatOpenAI(model=CHAT_MODEL, reasoning_effort="none").with_structured_output(
+        self.rerank_llm = ChatOpenAI(model=CHAT_MODEL, reasoning_effort="none", api_key=api_key).with_structured_output(
             RerankBatch, method="json_schema"
         )
-        with psycopg.connect(DB_URL, connect_timeout=5) as conn:
-            sif_exists = conn.execute("SELECT to_regclass('public.rag_day1_documents')").fetchone()[0]
-            kosha_exists = all(conn.execute("SELECT to_regclass(%s)", (f"public.{name}",)).fetchone()[0]
-                               for name in ("langchain_pg_embedding", "langchain_pg_collection"))
-            self.sif_count = conn.execute("SELECT count(*) FROM rag_day1_documents WHERE kind=%s AND embedding_model=%s AND vector_dims(embedding)=%s",
-                                          ("sif_case", EMBEDDING_MODEL, VECTOR_DIM)).fetchone()[0] if sif_exists else 0
-            self.kosha_count = conn.execute("""SELECT count(*) FROM langchain_pg_embedding e
-                JOIN langchain_pg_collection c ON e.collection_id=c.uuid
-                WHERE c.name=%s AND vector_dims(e.embedding)=%s""", (KOSHA_COLLECTION, VECTOR_DIM)).fetchone()[0] if kosha_exists else 0
-        self.kosha_store = PGVector(embeddings=self.embeddings, collection_name=KOSHA_COLLECTION,
-                                    connection=PGVECTOR_URL, use_jsonb=True, create_extension=False) if self.kosha_count else None
-
-    def recent_history(self, session_id: str, local_history: Sequence[dict]) -> list:
-        """Day 5 저장소를 우선 읽고, 저장소 장애 시 현재 Streamlit 세션 대화를 사용한다."""
         try:
             with psycopg.connect(DB_URL, connect_timeout=5) as conn:
-                return PostgresChatMessageHistory(HISTORY_TABLE, str(UUID(session_id)), sync_connection=conn).messages[-RECENT_MESSAGES:]
+                sif_exists = conn.execute("SELECT to_regclass('public.rag_day1_documents')").fetchone()[0]
+                kosha_exists = all(conn.execute("SELECT to_regclass(%s)", (f"public.{name}",)).fetchone()[0]
+                                   for name in ("langchain_pg_embedding", "langchain_pg_collection"))
+                self.sif_count = conn.execute("SELECT count(*) FROM rag_day1_documents WHERE kind=%s AND embedding_model=%s AND vector_dims(embedding)=%s",
+                                              ("sif_case", EMBEDDING_MODEL, VECTOR_DIM)).fetchone()[0] if sif_exists else 0
+                self.kosha_count = conn.execute("""SELECT count(*) FROM langchain_pg_embedding e
+                    JOIN langchain_pg_collection c ON e.collection_id=c.uuid
+                    WHERE c.name=%s AND vector_dims(e.embedding)=%s""", (KOSHA_COLLECTION, VECTOR_DIM)).fetchone()[0] if kosha_exists else 0
+        except psycopg.OperationalError:
+            if not DATABASE_URL_CONFIGURED:
+                raise SafetyRAGConfigurationError(
+                    "PostgreSQL에 연결할 수 없습니다. Cloud Secrets에 Supabase Session pooler의 SUPABASE_DB_URL을 설정해 주세요."
+                ) from None
+            if IS_SUPABASE:
+                raise SafetyRAGConfigurationError(
+                    "Supabase DB에 연결할 수 없습니다. Session pooler 주소·비밀번호·포트 5432와 접속 허용 상태를 확인해 주세요."
+                ) from None
+            raise SafetyRAGConfigurationError(
+                "설정된 PostgreSQL에 연결할 수 없습니다. DATABASE_URL의 주소·접속 권한·SSL 설정을 확인해 주세요."
+            ) from None
+        if not self.sif_count and not self.kosha_count:
+            raise SafetyRAGConfigurationError(
+                "연결된 DB에 SIF 사고사례와 kosha_guides 컬렉션이 없습니다. 기존 데이터를 Supabase DB에 적재해 주세요."
+            )
+        self.kosha_store = PGVector(
+            embeddings=self.embeddings,
+            collection_name=KOSHA_COLLECTION,
+            connection=PGVECTOR_URL,
+            use_jsonb=True,
+            create_extension=False,
+            engine_args={"pool_pre_ping": True, "pool_size": 1, "max_overflow": 0} if IS_SUPABASE else None,
+        ) if self.kosha_count else None
+
+    def recent_history(self, session_id: str, local_history: Sequence[dict]) -> list:
+        """DB 이력이 비거나 저장이 늦어도 현재 화면의 대화를 잃지 않는다."""
+        local_messages = []
+        for row in local_history[-RECENT_MESSAGES:]:
+            if row["role"] == "user":
+                local_messages.append(HumanMessage(content=row["content"]))
+            elif row.get("analysis") is not None:
+                local_messages.append(AIMessage(content=history_text(row["analysis"])))
+        try:
+            with psycopg.connect(DB_URL, connect_timeout=5) as conn:
+                db_messages = PostgresChatMessageHistory(HISTORY_TABLE, str(UUID(session_id)), sync_connection=conn).messages[-RECENT_MESSAGES:]
+            return local_messages if len(local_messages) > len(db_messages) else db_messages
         except Exception:
-            messages = []
-            for row in local_history[-RECENT_MESSAGES:]:
-                if row["role"] == "user":
-                    messages.append(HumanMessage(content=row["content"]))
-                elif row.get("analysis") is not None:
-                    messages.append(AIMessage(content=history_text(row["analysis"])))
-            return messages
+            return local_messages
 
     def save_turn(self, session_id: str, question: str, report: SafetyAnalysis) -> bool:
         """Day 5와 같은 chat_history 테이블에 Human/AI 메시지를 한 쌍으로 저장한다."""
@@ -328,6 +425,22 @@ class SafetyRAGService:
         return [Document(page_content=content, metadata={**metadata, "source_id": source_id, "distance": float(distance)})
                 for source_id, content, metadata, distance in rows]
 
+    def sif_keyword_search(self, vector: np.ndarray, terms: Sequence[str], k: int) -> list[Document]:
+        """처음 보는 장비·재료도 원문 단어가 들어 있는 사례를 벡터 후보에 섞는다."""
+        patterns = [f"%{term}%" for term in terms if len(term) >= 2]
+        if not patterns:
+            return []
+        with psycopg.connect(DB_URL, connect_timeout=5) as conn:
+            register_vector(conn)
+            rows = conn.execute("""SELECT source_id, content, metadata, embedding <=> %s AS distance
+                FROM rag_day1_documents
+                WHERE kind='sif_case' AND embedding_model=%s AND vector_dims(embedding)=%s
+                  AND (content ILIKE ANY(%s) OR metadata::text ILIKE ANY(%s))
+                ORDER BY distance LIMIT %s""",
+                (vector, EMBEDDING_MODEL, VECTOR_DIM, patterns, patterns, k)).fetchall()
+        return [Document(page_content=content, metadata={**metadata, "source_id": source_id, "distance": float(distance)})
+                for source_id, content, metadata, distance in rows]
+
     def retrieve_sif(self, vector: np.ndarray, context: WorkContext) -> list[Document]:
         if not self.sif_count:
             return []
@@ -344,10 +457,14 @@ class SafetyRAGService:
             if count:
                 active = candidate
                 break
-        pool = self.sif_search(vector, active, CANDIDATE_K) if active else []
+        pool = self.sif_search(vector, active, CANDIDATE_K) if active else self.sif_keyword_search(
+            vector, context.search_terms, CANDIDATE_K // 2
+        )
         ids = {doc.metadata["source_id"] for doc in pool}
-        pool.extend(doc for doc in self.sif_search(vector, {}, CANDIDATE_K)
-                    if doc.metadata["source_id"] not in ids)
+        for doc in self.sif_search(vector, {}, CANDIDATE_K):
+            if doc.metadata["source_id"] not in ids:
+                pool.append(doc)
+                ids.add(doc.metadata["source_id"])
         pool = pool[:CANDIDATE_K]
         if len(pool) <= TOP_K:
             return pool
@@ -381,11 +498,6 @@ class SafetyRAGService:
         if self.kosha_store is None:
             return []
         category = context.kosha_category
-        # 수집되지 않은 장비(예: 컨베이어)나 비안전 질문은 다른 GUIDE로 대체하지 않는다.
-        if context.equipment and category is None:
-            return []
-        if category is None and not context.work_type and not context.hazard:
-            return []
         if category:
             with psycopg.connect(DB_URL, connect_timeout=5) as conn:
                 count = conn.execute("""SELECT count(*) FROM langchain_pg_embedding e
@@ -397,6 +509,15 @@ class SafetyRAGService:
         hits = self.kosha_store.similarity_search_with_score_by_vector(
             vector.tolist(), k=40, filter={"category": category} if category else None
         )
+        # 카테고리를 모르는 질문도 전체 GUIDE를 찾되, 원문 작업 대상이 없는 문서는 내보내지 않는다.
+        if category is None:
+            hits = [(doc, distance) for doc, distance in hits
+                    if any(term.lower() in " ".join(str(value) for value in (
+                        doc.metadata.get("title", ""), doc.metadata.get("equipment", ""),
+                        doc.metadata.get("work_type", ""), doc.page_content)).lower()
+                        for term in context.search_terms)]
+            if not hits:
+                return []
         # Day 9 OCR에서 A-G-4-2025의 뒤쪽 페이지가 모두 '정의'로 이어진 오분류를 페이지별로 보정한다.
         ladder_sections = {
             5: "사다리식 통로 설치 기준", 6: "이동식 사다리 구조·사용 전 점검",
@@ -516,34 +637,55 @@ class SafetyRAGService:
         if not question:
             raise ValueError("작업이나 질문을 입력해 주세요.")
         history = self.recent_history(session_id, local_history)
-        query = make_search_query(question, history)
-        context = analyze_query(question, query)
-        if not (context.equipment or context.work_type or context.hazard):
-            report = SafetyAnalysis(
-                work_summary=question, sif_summary="관련 SIF 작업·장비를 식별하지 못했습니다.",
-                kosha_summary="관련 KOSHA 작업·장비를 식별하지 못했습니다.",
-                notice="수집된 산업안전 자료에서 이 작업에 맞는 근거를 찾기 어렵습니다. 작업명이나 장비를 더 구체적으로 알려주세요.",
-                search_query=query, debug={"query": asdict(context), "sif_top": [], "kosha_top": []},
-            )
-            saved = self.save_turn(session_id, question, report)
-            return SafetyAnalysis(**{**report.__dict__, "history_saved": saved})
-        vectors = [np.asarray(row, dtype=np.float32) for row in
-                   self.embeddings.embed_documents([context.sif_query, context.kosha_query])]
-        if any(len(vector) != VECTOR_DIM for vector in vectors):
+        followup = is_followup(question) and bool(history)
+        # 직전 실패 응답의 잘못된 주제 대신 현재 대화의 마지막 명시적 작업 질문을 기준으로 삼는다.
+        active_start = max((index for index, row in enumerate(local_history)
+                            if row.get("role") == "user" and not is_followup(row["content"])), default=0)
+        reports = [row["analysis"] for row in local_history[active_start:]
+                   if row.get("role") == "assistant" and row.get("analysis") is not None]
+        previous_topic = next((report.topic for report in reports if report.topic), None) if followup else None
+        query = make_search_query(question, history, previous_topic)
+        context = analyze_query(question, query, search_topic=previous_topic)
+
+        # 여러 턴 중 직전 답변이 근거를 못 찾았어도 같은 작업의 최근 근거를 잃지 않는다.
+        same_topic = [report for report in reversed(reports) if report.topic == previous_topic] if previous_topic else []
+        sif_source = next((report for report in same_topic if report.sif_documents), None)
+        kosha_source = next((report for report in same_topic if report.kosha_documents), None)
+        previous_sif = sif_source.sif_documents if sif_source else []
+        previous_kosha = kosha_source.kosha_documents if kosha_source else []
+        reuse_sif = bool(followup and previous_sif)
+        reuse_kosha = bool(followup and previous_kosha and (
+            kosha_source.intent == context.intent or context.intent == "일반"
+        ))
+        sif_docs = list(previous_sif) if reuse_sif else []
+        kosha_docs = list(previous_kosha) if reuse_kosha else []
+        needed = []
+        if not reuse_sif and self.sif_count:
+            needed.append(("sif", context.sif_query))
+        if not reuse_kosha and self.kosha_count:
+            needed.append(("kosha", context.kosha_query))
+        embedded = self.embeddings.embed_documents([text for _, text in needed]) if needed else []
+        vectors = {kind: np.asarray(row, dtype=np.float32)
+                   for (kind, _), row in zip(needed, embedded)}
+        if any(len(vector) != VECTOR_DIM for vector in vectors.values()):
             raise RuntimeError("질문 임베딩 차원이 저장된 자료와 다릅니다.")
 
-        # Day 10처럼 한쪽 검색의 실패가 다른 쪽 검색을 막지 않게 한다.
+        # 한쪽 검색 실패가 다른 쪽 검색 또는 직전 대화의 근거를 지우지 않게 한다.
         retrieval_notes = []
-        try:
-            sif_docs = self.retrieve_sif(vectors[0], context)
-        except Exception:
-            sif_docs = []
-            retrieval_notes.append("SIF 검색을 완료하지 못했습니다.")
-        try:
-            kosha_docs = self.retrieve_kosha(vectors[1], context)
-        except Exception:
-            kosha_docs = []
-            retrieval_notes.append("KOSHA 검색을 완료하지 못했습니다.")
+        if "sif" in vectors:
+            try:
+                sif_docs = self.retrieve_sif(vectors["sif"], context)
+            except Exception:
+                retrieval_notes.append("SIF 검색을 완료하지 못했습니다.")
+        if "kosha" in vectors:
+            try:
+                kosha_docs = self.retrieve_kosha(vectors["kosha"], context)
+            except Exception:
+                retrieval_notes.append("KOSHA 검색을 완료하지 못했습니다.")
+        if followup and not kosha_docs and previous_kosha:
+            # 새 목적의 검색이 비어도 같은 작업의 이전 GUIDE를 근거 후보로 다시 평가한다.
+            kosha_docs = list(previous_kosha)
+            retrieval_notes.append("같은 작업의 이전 KOSHA 근거를 다시 확인했습니다.")
 
         debug = {
             "query": asdict(context),
@@ -557,18 +699,23 @@ class SafetyRAGService:
                            "rerank_reason": m.get("rerank_reason")}
                           for m in (doc.metadata for doc in kosha_docs)],
             "retrieval_notes": retrieval_notes,
+            "followup": followup,
+            "history_messages": len(history),
+            "reused_evidence": {"sif": reuse_sif, "kosha": reuse_kosha},
         }
 
         if not sif_docs and not kosha_docs:
             report = SafetyAnalysis(work_summary=question, sif_summary="검색된 SIF 사고사례가 없습니다.",
                                     kosha_summary="검색된 KOSHA GUIDE가 없습니다.",
-                                    notice="관련 근거를 확보하지 못해 위험이나 예방조치를 제시할 수 없습니다.",
-                                    search_query=query, debug=debug)
+                                    notice="직접 관련된 근거를 찾지 못했습니다. 작업명·재료·설비를 조금 더 구체적으로 알려주세요.",
+                                    search_query=query, debug=debug, topic=context.topic,
+                                    intent=context.intent, followup=followup)
         else:
             draft = self.answer_llm.invoke(ANSWER_PROMPT.invoke({
                 "history": history, "question": question, "sif_query": context.sif_query,
                 "kosha_query": context.kosha_query,
                 "work_context": f"장비={context.equipment or '미지정'}, 작업={context.work_type or '미지정'}, 위험={', '.join(context.hazard) or '미지정'}",
+                "followup": "예" if followup else "아니요", "intent": context.intent,
                 "industry": industry or "지정 없음", "sif_context": sif_context(sif_docs),
                 "kosha_context": kosha_context(kosha_docs),
             }))
@@ -596,7 +743,8 @@ class SafetyRAGService:
                 prevention=[] if unsupported else draft.prevention,
                 sif_cases=[to_evidence(doc, "sif") for doc in sif_docs],
                 kosha_guides=[to_evidence(doc, "kosha") for doc in kosha_docs], notice=notice,
-                search_query=query, debug=debug,
+                search_query=query, debug=debug, topic=context.topic, intent=context.intent,
+                followup=followup, sif_documents=sif_docs, kosha_documents=kosha_docs,
             )
         if retrieval_notes:
             report = SafetyAnalysis(**{**report.__dict__, "notice": (report.notice + " " + " ".join(retrieval_notes)).strip()})

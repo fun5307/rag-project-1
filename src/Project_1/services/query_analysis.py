@@ -1,6 +1,7 @@
-"""작업·장비 질문을 두 Retriever가 쓸 Work Context로 변환한다."""
+"""질문 원문을 보존하고, 알려진 장비·작업명은 검색 힌트로만 사용한다."""
 
 from dataclasses import dataclass
+import re
 
 
 EQUIPMENT_ALIASES = {
@@ -48,7 +49,26 @@ INTENT_TERMS = {
     "위험": "작업 위험요인 안전조치 작업방법",
     "일반": "안전작업 방법 점검사항 예방조치",
 }
-SEARCH_OBJECT_TERMS = ("팔레트", "배관", "철재", "외벽", "조명")
+SEARCH_STOPWORDS = {
+    "그럼", "그러면", "그중", "작업", "사고", "사례", "위험", "안전", "예방", "점검",
+    "확인", "사항", "무엇", "어떻게", "공장", "관련", "대책", "방법", "필요",
+    "하나", "주의", "알려줘", "예방하려면", "방지하려면", "중요한", "하려면",
+    "전에", "후에", "확인해야", "확인하면", "어떤", "조치", "해주세요", "해줘",
+}
+PARTICLES = ("에서", "으로", "에게", "부터", "까지", "처럼", "보다", "할때", "시켜", "할", "을", "를", "은", "는", "이", "가", "에", "의", "로")
+
+
+def meaningful_terms(text: str) -> tuple[str, ...]:
+    """등록 단어와 무관하게 원문에서 검색할 작업 대상·재료 표현을 남긴다."""
+    terms = []
+    for token in re.findall(r"[가-힣A-Za-z0-9]+", text):
+        for particle in PARTICLES:
+            if token.endswith(particle) and len(token) - len(particle) >= 2:
+                token = token[:-len(particle)]
+                break
+        if len(token) >= 2 and token not in SEARCH_STOPWORDS and token not in terms:
+            terms.append(token)
+    return tuple(terms[:6])
 
 
 @dataclass(frozen=True)
@@ -62,10 +82,13 @@ class WorkContext:
     kosha_category: str | None
     sif_query: str
     kosha_query: str
+    topic: str
+    search_terms: tuple[str, ...]
 
 
-def analyze_query(question: str, resolved_question: str | None = None) -> WorkContext:
-    """명시된 작업·장비를 먼저 읽고 안전 분야별 검색 문장을 따로 만든다."""
+def analyze_query(question: str, resolved_question: str | None = None,
+                  search_topic: str | None = None) -> WorkContext:
+    """원문을 양쪽 검색에 전달하고, 사전에 있는 표현만 metadata 힌트로 쓴다."""
     resolved = (resolved_question or question).strip()
     text = resolved.lower()
     equipment = next(
@@ -94,10 +117,10 @@ def analyze_query(question: str, resolved_question: str | None = None) -> WorkCo
         elif work_type == "줄걸이·인양":
             category = "크레인·줄걸이"
 
-    # 장비·작업 유형만 남기면 팔레트 같은 현재 작업 대상이 사라져 검색이 넓어진다.
-    work_objects = tuple(term for term in SEARCH_OBJECT_TERMS if term in text)
-    core = " ".join(part for part in (equipment, work_type, *work_objects, *hazards) if part)
-    sif_query = f"{core} 산업재해 유사 사고사례 사고 원인 재해유발요인".strip()
-    kosha_query = f"{core} {INTENT_TERMS[intent]}".strip()
+    terms = meaningful_terms(search_topic or resolved)
+    topic = search_topic or " ".join(dict.fromkeys(part for part in (equipment, work_type, *terms) if part)) or question
+    search_text = topic if search_topic else resolved
+    sif_query = f"{search_text} 산업재해 유사 사고사례 사고 원인 재해유발요인"
+    kosha_query = f"{search_text} {INTENT_TERMS[intent]}"
     return WorkContext(question.strip(), resolved, equipment, work_type, hazards, intent,
-                       category, sif_query, kosha_query)
+                       category, sif_query, kosha_query, topic, terms)

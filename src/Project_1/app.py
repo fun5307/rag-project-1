@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import streamlit as st
 
-from services.safety_rag import SafetyAnalysis, analyze_work
+from services.safety_rag import SafetyAnalysis, SafetyRAGConfigurationError, analyze_work, is_followup
 from services.statistics import (
     SIZE_ORDER, industry_death_rate_comparison,
     industry_totals, industry_trend, kpi_value, load_statistics,
@@ -43,15 +43,23 @@ def render_analysis(report: SafetyAnalysis | None):
         st.info("이전 대화의 분석 결과가 없습니다.")
         return
 
-    st.markdown("#### 작업 및 위험요인 요약")
+    followup = getattr(report, "followup", False)
+    st.markdown("#### 이번 질문에 대한 답변" if followup else "#### 작업 및 위험요인 요약")
     st.write(report.work_summary)
-    for hazard in report.hazards:
-        st.write(f"• {hazard}")
+    if not followup or report.intent == "위험" or not report.prevention:
+        for hazard in report.hazards:
+            st.write(f"• {hazard}")
+    if followup and report.prevention:
+        for action in report.prevention:
+            st.write(f"• {action}")
 
     sif_col, kosha_col = st.columns(2)
     with sif_col:
         st.markdown("#### 실제 유사 사고사례 — SIF")
-        st.write(report.sif_summary)
+        if followup and report.sif_cases and report.debug.get("reused_evidence", {}).get("sif"):
+            st.caption("앞선 답변에서 확인한 사고사례를 사용했습니다.")
+        else:
+            st.write(report.sif_summary)
         for rank, item in enumerate(report.sif_cases, 1):
             with st.expander(f"[SIF-{rank}] {item.title}"):
                 st.write(f"doc_id: {item.source_id}")
@@ -60,7 +68,10 @@ def render_analysis(report: SafetyAnalysis | None):
                 st.write(item.excerpt)
     with kosha_col:
         st.markdown("#### 관련 안전기준 — KOSHA GUIDE")
-        st.write(report.kosha_summary)
+        if followup and report.kosha_guides and report.debug.get("reused_evidence", {}).get("kosha"):
+            st.caption("앞선 답변에서 확인한 안전기준을 사용했습니다.")
+        else:
+            st.write(report.kosha_summary)
         for rank, item in enumerate(report.kosha_guides, 1):
             with st.expander(f"[GUIDE-{rank}] {item.title}"):
                 st.write(f"guide_id: {item.source_id}")
@@ -70,12 +81,13 @@ def render_analysis(report: SafetyAnalysis | None):
                 if item.source_url:
                     st.link_button("공식 출처", item.source_url)
 
-    st.markdown("#### 종합 예방조치")
-    if report.prevention:
-        for action in report.prevention:
-            st.write(f"• {action}")
-    else:
-        st.write("검색 근거만으로 예방조치를 제시하기 어렵습니다.")
+    if not followup:
+        st.markdown("#### 종합 예방조치")
+        if report.prevention:
+            for action in report.prevention:
+                st.write(f"• {action}")
+        else:
+            st.write("검색 근거만으로 예방조치를 제시하기 어렵습니다.")
     if report.notice:
         st.info(report.notice)
     debug = getattr(report, "debug", {})
@@ -140,13 +152,16 @@ with safety_tab:
         question = question.strip()
         previous = st.session_state.safety_messages.copy()
         try:
-            with st.spinner("SIF 사고사례와 KOSHA 안전기준을 찾고 있습니다..."):
+            status = ("이전 대화의 근거를 확인하고 있습니다..." if previous and is_followup(question)
+                      else "SIF 사고사례와 KOSHA 안전기준을 찾고 있습니다...")
+            with st.spinner(status):
                 report = analyze_work(question, st.session_state.safety_session_id, previous, industry)
             reply = {"role": "assistant", "analysis": report}
+        except SafetyRAGConfigurationError as exc:
+            reply = {"role": "assistant", "error": str(exc)}
         except Exception:
             logger.exception("작업 안전 상담 처리 실패")
-            st.exception(e)
-            # reply = {"role": "assistant", "error": "지금은 안전 근거를 조회하거나 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."}
+            reply = {"role": "assistant", "error": "지금은 안전 근거를 조회하거나 답변을 생성할 수 없습니다. 잠시 후 다시 시도해 주세요."}
         st.session_state.safety_messages.extend([
             {"role": "user", "content": question},
             reply,

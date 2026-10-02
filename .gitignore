@@ -5,10 +5,14 @@ build/
 dist/
 wheels/
 *.egg-info
-/data
+
 
 # Virtual environments
 .venv
 
 # env
 .env
+.streamlit/secrets.toml
+
+# data
+src/Project_1/data
